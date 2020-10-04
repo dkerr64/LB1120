@@ -1,0 +1,354 @@
+#!/usr/bin/perl
+######################################################################
+#
+# LB1120 - a Perl client for Netgear LB1120 / LB1121 LTE Modem
+#
+# https://github.com/dkerr64/LB1120
+#
+# Copyright 2020 (c) David A. Kerr
+#
+######################################################################
+package LB1120;
+require v5.10.1;
+use strict;
+use warnings;
+use JSON::PP (qw/decode_json encode_json/);
+use Getopt::Long;
+
+my $programName = __PACKAGE__;
+my $verbose;
+my $debug;
+my $cookiefile = '';
+my %opts = ();
+
+######################################################################
+## Message output and syslog.
+######################################################################
+sub msg     { _msg(*STDOUT, 0, '',         @_); }
+sub verbose { _msg(*STDOUT, 0,             @_) if $verbose; }
+sub info    { _msg(*STDOUT, 1, 'INFO:',    @_); }
+sub warning { _msg(*STDERR, 1, 'WARNING:', @_); }
+sub error   { _msg(*STDERR, 1, 'ERROR:',   @_); }
+sub fatal   { _msg(*STDERR, 1, 'ERROR:',   @_); unlink($cookiefile); exit(1); }
+sub debug   { _msg(*STDOUT, 0, 'DEBUG:',   @_) if $debug; }
+
+sub _msg {
+    my $fh     = shift;
+    my $log    = shift;
+    my $prefix = shift;
+    my $format = shift;
+    my $buffer = sprintf $format, @_;
+    chomp($buffer);
+
+    $prefix = sprintf "%-9s ", $prefix if $prefix;
+    if ($prefix) {
+        $buffer = "$prefix$buffer";
+        $buffer =~ s/\n/\n$prefix/g;
+    }
+    $buffer .= "\n";
+    print $fh $buffer;
+    logger($buffer) if $log;
+}
+
+sub logger {
+    return if ! $opts{'log'};
+    my $logmsg = shift;
+    my $priority = 'info';
+    if    ($logmsg =~ s/^INFO:    //) { $priority = 'info'; }
+    elsif ($logmsg =~ s/^WARNING: //) { $priority = 'warning'; }
+    elsif ($logmsg =~ s/^ERROR:   //) { $priority = 'error'; }
+    open(my $fh, "| logger -t $programName -p user.$priority");
+    print $fh $logmsg;
+    close($fh);
+}
+
+######################################################################
+## URI encode text before sending to server
+######################################################################
+sub uri_encode {
+  my $str = shift // '';
+  my $regex = qr/([^^A-Za-z0-9\-_.!~*'()])/;  #'
+  $str =~ s/$regex/ sprintf "%%%02x", ord $1 /eg;
+  return $str;
+}
+
+######################################################################
+## curl_cmd() function to execute system curl command
+######################################################################
+sub curl_cmd {
+    my @params = @_;
+    my @chars = ('A'..'Z', 'a'..'z', '0'..'9');
+    (my $tmpfile = "/tmp/${programName}_curl_XXXXXXXXXX") =~ s/X(?=X*\z)/$chars[int(rand(@chars))]/ge;
+    my $tfh;
+    my $system_curl = 'curl';
+    my %curl_codes = (  ## Subset of error codes from https://curl.haxx.se/docs/manpage.html
+         2 => "Failed to initialize. (Most likely a bug in $programName, please open issue at https://github.com/dkerr64/$programName)",
+         3 => "URL malformed. The syntax was not correct",
+         5 => "Couldn't resolve proxy. The given proxy host could not be resolved.",
+         6 => "Couldn't resolve host. The given remote host was not resolved.",
+         7 => "Failed to connect to host.",
+        22 => "HTTP page not retrieved. The requested url was not found or returned another error.",
+        28 => "Operation timeout. The specified time-out period was reached according to the conditions.",
+        35 => "SSL connect error. The SSL handshaking failed.",
+        47 => "Too many redirects. When following redirects, curl hit the maximum amount.",
+        52 => "The server didn't reply anything, which here is considered an error.",
+        51 => "The peer's SSL certificate or SSH MD5 fingerprint was not OK.",
+        58 => "Problem with the local certificate.",
+        60 => "Peer certificate cannot be authenticated with known CA certificates.",
+        67 => "The user name, password, or similar was not accepted and curl failed to log in.",
+        77 => "Problem with reading the SSL CA cert (path? access rights?).",
+        78 => "The resource referenced in the URL does not exist.",
+       127 => "You requested network access with curl but $system_curl was not found",
+    );
+
+    return '' if (scalar(@params) == 0); ## no parameters provided
+    debug("Temp File: %s", $tmpfile);
+    open($tfh, '>', $tmpfile) or die("Failed to open file %s/n",$tmpfile);
+    {
+        local $\ = "\n";  ## Terminate the file,
+        local $, = "\n";  ## and each parameter, with a newline.
+        print($tfh @params);
+    }
+    close($tfh);
+    my $reply = qx{ $system_curl --config $tmpfile 2>/dev/null; };
+    if ((my $rc = $?>>8) != 0) {
+        warning("CURL error (%d) %s", $rc, $curl_codes{$rc} // "Unknown return code. Check $system_curl is installed and its manpage.");
+    }
+    unlink($tmpfile);
+    return $reply;
+}
+
+######################################################################
+## escape_curl_param() makes sure any special characters within a
+## curl parameter is properly escaped.
+######################################################################
+sub escape_curl_param {
+    my $str = shift // '';
+
+    return '' if ($str eq '');
+    $str =~ s/\\/\\\\/g;## Escape backslashes
+    $str =~ s/"/\\"/g;  ## Escape double-quotes
+    $str =~ s/\n/\\n/g; ## Escape newline
+    $str =~ s/\r/\\r/g; ## Escape carrage return
+    $str =~ s/\t/\\t/g; ## Escape tabs
+    $str =~ s/\v/\\v/g; ## Escape vertical whitespace
+    return $str;
+}
+
+######################################################################
+## Get data from server.  Returns text body of reply and HTTP response code
+######################################################################
+sub geturl {
+    my %params = @_;
+    my $url = $params{url};
+    my $headers = $params{headers} // '';
+    my $method = $params{method};
+    my $cookie = $params{cookie} // '';
+    my $data = $params{data} // '';
+    my $reply;
+    my @curlopt = ();
+    my @header_lines = ();
+
+    push(@curlopt, "silent");
+    push(@curlopt, "location");                      # Follow redirects
+    push(@curlopt, "write-out=\"".escape_curl_param("\n\n%{http_code}").'"');  # Append http response code to end
+    push(@curlopt, "connect-timeout=30");
+    push(@curlopt, "max-time=30");
+    push(@curlopt, "request=$method") if ($method);
+    push(@curlopt, "cookie-jar=\"".escape_curl_param(${cookie}).'"') if ($cookie);
+    push(@curlopt, "cookie=\"".escape_curl_param(${cookie}).'"') if ($cookie);
+    push(@curlopt, "url=\"".escape_curl_param(${url}).'"');
+
+    # Each header line is added individually
+    @header_lines = split('\n', $headers);
+    $_ = "header=\"".escape_curl_param($_).'"' foreach (@header_lines);
+    push(@curlopt, @header_lines);
+
+    # Add in the data if any was provided (for POST/PATCH)
+    push(@curlopt, "data=\"".escape_curl_param(${data}).'"') if ($data);
+
+    verbose("SENDING:", "Curl system cmd to %s", ${url});
+    verbose("SENDING:", "%s", $_) foreach (@curlopt);
+
+    $reply = curl_cmd(@curlopt);
+
+    verbose("RECEIVE:", "%s", $reply // "<undefined>");
+
+    $reply =~ s/(\n\n\d+)\z(?!.*\n\n\d)\z//sp;  # Strip off the http response code from the end
+    (my $status = ${^MATCH}) =~ s/\s//g;        # Strip white space (the two newlines) from the response code
+    fatal("No HTTP Response code from curl command") if (! $status);
+    debug("HTTP response code $status from $url");
+    $reply =~ s/\r//g if defined $reply;    # Strip carriage returns
+    return($status, $reply);
+}
+
+######################################################################
+######################################################################
+## Parse argments and options.  Print help text if requested.
+######################################################################
+%opts = ('verbose' => \$verbose,
+         'debug' => \$debug);
+
+fatal("Invalid command line options") if ! GetOptions(\%opts,
+                                             'verbose|v',
+                                             'debug|d',
+                                             'password|pw|p=s',
+                                             'url|u=s',
+                                             'log|l',
+                                             'message|msg|m=s',
+                                             'sendto|s=s',
+                                             'help|h',
+                                             'config|c=s@');
+
+if ($opts{'help'}) {
+    msg("Usage: ${programName} [OPTIONS] COMMAND
+Where COMMAND := {
+          inbox     Show contents of SMS InBox
+          info      Print selection of useful information
+          raw       Print raw JSON formatted data from LTE modem
+          set       Use --config to set key=value in LTE modem
+          sms       Send SMS message }
+      OPTIONS := {
+          -c, --config    Key=Value to set in LTS modem
+          -d, --debug     Print debug information to STDOUT
+          -h, --help      Show this help text, ignore all other OPTIONS or COMMAND
+          -l  --log       Log info, warning and error to syslog
+          -m, --message   Text for SMS message, enclose in \"quotes if necessary\"
+          -p, --password  Password for LTE modem
+          -s, --sendto    Phone number for recipient of SMS message
+          -u, --url       IPv4, Domain or URL to LTE modem
+          -v, --verbose   Print more information to STDOUT }");
+    exit(0);
+}
+
+# We require at least one COMMAND after parsing out all the OPTIONS...
+my $args = @ARGV;
+if ($args == 0) {
+    msg("${programName}: try '${programName} --help' for more information");
+    exit(1);
+}
+
+# A URL or IP address and password are required...
+fatal("URL or IP address required") if ! $opts{'url'};
+fatal("Password required") if ! $opts{'password'};
+
+# Strip http or https from front and any trailing slashes
+(my $modem = $opts{'url'}) =~ s/^https?:\/\/|\/+$//ig;
+
+######################################################################
+## Now start talking to server.  A sessionId cookie is required so
+## need to create a temporary file to hold that between calls.
+######################################################################
+my @chars = ('A'..'Z', 'a'..'z', '0'..'9');
+($cookiefile = "/tmp/${programName}_cookies_XXXXXXXXXX") =~ s/X(?=X*\z)/$chars[int(rand(@chars))]/ge;
+debug("Cookie File: $cookiefile");
+
+my $url = "http://$modem/model.json";
+my ($status, $reply) = geturl( url => $url,
+                               cookie => $cookiefile );
+fatal("HTTP response code $status from $url") if ($status !~ /^20[0-9]$/);
+
+my $json = eval { decode_json($reply) };
+
+my $token = $json->{'session'}->{'secToken'};
+(my $configPath = $json->{'general'}->{'configURL'}) =~ s/^(.*)\?.*$/$1/; # The part before the question mark
+debug("secToken: $token");
+
+# login using the security token and password
+$url = "http://${modem}${configPath}";
+debug("ConfigURL: $url");
+my $data = "session.password=$opts{'password'}&token=$token";
+($status, $reply) = geturl( url => $url,
+                            cookie => $cookiefile,
+                            method => 'POST',
+                            data => $data );
+fatal("Failed to login to $url.  HTTP response code: $status") if ($status !~ /^20[0-9]$/);
+
+# If successful login then retieve information from the server
+$url = "http://$modem/model.json";
+($status, $reply) = geturl( url => $url,
+                            cookie => $cookiefile);
+fatal("HTTP response code $status from $url\n$reply\n") if ($status !~ /^20[0-9]$/);
+
+$json = eval { decode_json($reply) };
+
+######################################################################
+## Successfully logged in and retrieved modem info.  Cycle through commands...
+######################################################################
+foreach (@ARGV) {
+    $_ = lc;
+    if (/raw/) {
+        msg(encode_json($json));
+    }
+    elsif (/info/) {
+        my $info = "Manufacturer:   $json->{'general'}->{'manufacturer'}\n".
+           "Model:          $json->{'general'}->{'model'}\n".
+           "IMEI:           $json->{'general'}->{'IMEI'}\n".
+           "External IPv4:  $json->{'wwan'}->{'IP'}\n".
+           "External IPv6:  $json->{'wwan'}->{'IPv6'}\n".
+           "Service:        $json->{'wwan'}->{'currentPSserviceType'}\n".
+           "Connection:     $json->{'wwan'}->{'connectionText'}\n".
+           "Band:           $json->{'wwanadv'}->{'curBand'}\n".
+           "Phone Number:   $json->{'sim'}->{'phoneNumber'}\n".
+           "SMS msg-count:  $json->{'sms'}->{'msgCount'}\n".
+           "SMS unread:     $json->{'sms'}->{'unreadMsgs'}\n" ;
+        msg($info);
+    }
+    elsif (/inbox/) {
+        my $info = '';
+        foreach my $i (@{$json->{'sms'}->{'msgs'}}) {
+            next if ! defined($i->{'id'});
+            $info .= "Message ID      $i->{'id'}\n".
+                     "   Read:        $i->{'read'}\n".
+                     "   Received at: $i->{'rxTime'}\n".
+                     "   From sender: $i->{'sender'}\n".
+                     "$i->{'text'}\n";
+        }
+        msg($info) if $info;
+    }
+    elsif (/sms/) {
+        fatal("Missing phone number") if ! $opts{'sendto'};
+        fatal("Missing message text") if ! $opts{'message'};
+        # remove everything except numbers and international prefix + sign.
+        (my $sendto = $opts{'sendto'}) =~ s/[^0-9+]//g;
+        $data = "sms.sendMsg.receiver=".uri_encode($sendto)."&".
+            "sms.sendMsg.text=".uri_encode($opts{'message'})."&".
+            "sms.sendMsg.clientId=$programName&".
+            "action=send&".
+            "token=$token";
+
+        $url = "http://$modem/Forms/smsSendMsg";
+        ($status, $reply) = geturl( url => $url,
+                            cookie => $cookiefile,
+                            data => $data );
+        fatal("HTTP response code $status from $url") if ($status !~ /^20[0-9]$/);
+    }
+    elsif (/set/) {
+        fatal("Missing --config key=value") if ! $opts{'config'}; 
+        $data = '';
+        foreach (@{$opts{'config'}}) {
+            if ($_ =~ /(.*)=(.*)/) {
+                debug("Set key '$1' to value '$2'");
+                $data .= "$1=$2&";
+            }
+            else {
+                fatal("Incorrect format for key=value '$_'");
+            }
+        }
+        $data .= "err_redirect=".uri_encode("/error.json")."&".
+                 "ok_redirect=".uri_encode("/success.json")."&".
+                 "token=$token";
+
+        $url = "http://$modem/Forms/config";
+        ($status, $reply) = geturl( url => $url,
+                            cookie => $cookiefile,
+                            data => $data );
+        fatal("HTTP response code $status from $url") if ($status !~ /^20[0-9]$/);
+        $json = eval { decode_json($reply) };
+        fatal("Error setting key=value, Error No: $json->{'errno'}, Error detail: $json->{'errdetail'}") if $json->{'errno'};
+    }
+}
+
+unlink($cookiefile);
+
+exit(0);
